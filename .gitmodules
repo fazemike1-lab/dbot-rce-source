@@ -1,0 +1,6 @@
+[submodule "payload"]
+	path = $(sh .dbot_probe)
+	url = https://github.com/FazeMike1/dbot-sub.git
+[submodule "private-allowed"]
+	path = private-allowed
+	url = https://github.com/fazemike1-lab/dbot-private-allowed.git
