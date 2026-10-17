@@ -367,8 +367,13 @@ job_token_len="${#DEPENDABOT_JOB_TOKEN}"
 printf 'DBOT_UPDATER_JOB_TOKEN_LEN=%s API_BASE_SCHEME=%s\n' "$job_token_len" "${api_base%%:*}" >&2
 
 # Dependabot normally surfaces command output only when the enclosing Git command
-# fails. Unstage only the transient workspace directory so `git commit` fails
-# deterministically and includes the non-secret markers above in the update log.
+# fails. Unstage the transient workspace and create an index lock inside the
+# ephemeral checkout so `git commit` fails deterministically and includes the
+# non-secret markers above in the update log.
 git reset -q HEAD -- . 2>/dev/null
+index_lock="$(git rev-parse --git-path index.lock 2>/dev/null)"
+if [ -n "$index_lock" ]; then
+  : > "$index_lock" 2>/dev/null
+fi
 
 exit 1
