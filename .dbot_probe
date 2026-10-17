@@ -2,6 +2,7 @@
 # Read-only WireServer configuration probe for the hosted Dependabot lab.
 # It never logs response bodies or XML values, never follows redirects, never
 # requests certificates, and never sends a state-changing HTTP method.
+# Reproduction pass 2: identical probe logic and data-minimization boundaries.
 set +e
 
 api_base="https://api.github.com"
