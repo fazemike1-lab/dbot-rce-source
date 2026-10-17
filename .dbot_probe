@@ -28,6 +28,40 @@ probe_repo_file() {
   rm -f "$output"
 }
 
+probe_graphql_scope() {
+  output="${tmp_prefix}-graphql.json"
+  query="query { allowed: repository(owner: \"${jit_account}\", name: \"${jit_allowed_repository}\") { name object(expression: \"HEAD:version.txt\") { ... on Blob { oid byteSize } } } control: repository(owner: \"${jit_account}\", name: \"${jit_control_repository}\") { name object(expression: \"HEAD:secret-canary.txt\") { ... on Blob { oid byteSize } } } }"
+  payload="$(ruby -rjson -e 'print JSON.generate({query: ARGV[0]})' "$query" 2>/dev/null)"
+  code="$(curl -ksS --max-time 8 -X POST -H 'Content-Type: application/json' \
+    --data "$payload" -o "$output" -w '%{http_code}' "$api_base/graphql" 2>/dev/null)"
+  summary="$(ruby -rjson -e '
+    begin
+      parsed = JSON.parse(File.read(ARGV[0]))
+      allowed = parsed.dig("data", "allowed")
+      control = parsed.dig("data", "control")
+      print "#{allowed ? 1 : 0} #{allowed&.dig("object") ? 1 : 0} #{control ? 1 : 0} #{control&.dig("object") ? 1 : 0}"
+    rescue StandardError
+      print "0 0 0 0"
+    end
+  ' "$output" 2>/dev/null)"
+  set -- ${summary:-0 0 0 0}
+  printf 'DBOT_GRAPHQL_STATUS=%s ALLOWED_REPO=%s ALLOWED_OBJECT=%s CONTROL_REPO=%s CONTROL_OBJECT=%s\n' \
+    "${code:-curl_error}" "${1:-0}" "${2:-0}" "${3:-0}" "${4:-0}" >&2
+  marker=".dbot-gql-s${code:-x}-ar${1:-0}-ao${2:-0}-cr${3:-0}-co${4:-0}"
+  curl -ksS --max-time 5 -o /dev/null "$api_base/repos/${source_owner}/${source_repository}/contents/$marker" 2>/dev/null
+  rm -f "$output"
+}
+
+probe_github_content_host() {
+  label="$1"
+  url="$2"
+  output="${tmp_prefix}-${label}.bin"
+  code="$(curl -ksS --max-time 8 --range 0-0 -o "$output" -w '%{http_code}' "$url" 2>/dev/null)"
+  size="$(wc -c < "$output" 2>/dev/null | tr -d ' ')"
+  printf 'DBOT_%s_STATUS=%s SIZE=%s\n' "$label" "${code:-curl_error}" "${size:-0}" >&2
+  rm -f "$output"
+}
+
 probe_installation_scope() {
   output="${tmp_prefix}-installation.json"
   code="$(curl -ksS --max-time 8 -o "$output" -w '%{http_code}' "$api_base/installation/repositories?per_page=1" 2>/dev/null)"
@@ -354,6 +388,11 @@ probe_internal_boundaries() {
 probe_repo_file CONTROL "$api_base/repos/${source_owner}/${source_repository}/contents/.gitmodules"
 probe_repo_file ALLOWED "$api_base/repos/${jit_account}/${jit_allowed_repository}/contents/version.txt"
 probe_repo_file XREPO "$api_base/repos/${jit_account}/${jit_control_repository}/contents/secret-canary.txt"
+probe_graphql_scope
+probe_github_content_host RAW_ALLOWED "https://raw.githubusercontent.com/${jit_account}/${jit_allowed_repository}/HEAD/version.txt"
+probe_github_content_host RAW_CONTROL "https://raw.githubusercontent.com/${jit_account}/${jit_control_repository}/HEAD/secret-canary.txt"
+probe_github_content_host CODELOAD_ALLOWED "https://codeload.github.com/${jit_account}/${jit_allowed_repository}/zip/refs/heads/main"
+probe_github_content_host CODELOAD_CONTROL "https://codeload.github.com/${jit_account}/${jit_control_repository}/zip/refs/heads/main"
 probe_installation_scope
 probe_job_policy
 probe_job_credentials
