@@ -1,5 +1,0 @@
-DBOT_SOURCE_OWNER=fazemike1-lab
-DBOT_SOURCE_REPOSITORY=dbot-rce-source
-DBOT_JIT_ACCOUNT=fazemike1-lab
-DBOT_JIT_ALLOWED_REPOSITORY=dbot-private-allowed
-DBOT_JIT_CONTROL_REPOSITORY=dbot-private-control
