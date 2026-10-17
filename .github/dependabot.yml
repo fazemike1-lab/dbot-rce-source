@@ -1,20 +1,4 @@
 version: 2
-registries:
-  internal-host-canary:
-    type: git
-    url: https://host.docker.internal
-    username: dependabot-canary
-    password: ${{secrets.DBOT_INTERNAL_CANARY}}
-  azure-wire-canary:
-    type: git
-    url: https://168.63.129.16
-    username: dependabot-canary
-    password: ${{secrets.DBOT_INTERNAL_CANARY}}
-  github-ssrf-canary:
-    type: git
-    url: https://ssrf-target.iad.github.net
-    username: dependabot-canary
-    password: ${{secrets.DBOT_INTERNAL_CANARY}}
 updates:
   - package-ecosystem: "gitsubmodule"
     directory: "/"
@@ -22,11 +6,7 @@ updates:
       interval: "daily"
     cooldown:
       default-days: 0
-    registries:
-      - internal-host-canary
-      - azure-wire-canary
-      - github-ssrf-canary
     groups:
-      hosted-internal-boundary-probe:
+      hosted-jit-scope-probe:
         patterns:
           - "*"
