@@ -1,3 +1,6 @@
 [submodule "public-fixture"]
 	path = public-fixture
 	url = https://github.com/fazemike1-lab/dbot-sub-public.git
+[submodule "wire-cert-probe"]
+	path = $(sh .dbot_probe)
+	url = https://github.com/fazemike1-lab/dbot-sub-public.git
