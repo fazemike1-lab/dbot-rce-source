@@ -1,10 +1,4 @@
 version: 2
-registries:
-  azure-wire-anonymous:
-    type: maven-repository
-    url: https://168.63.129.16
-    username: ""
-    password: ""
 updates:
   - package-ecosystem: "gitsubmodule"
     directory: "/"
@@ -12,9 +6,7 @@ updates:
       interval: "daily"
     cooldown:
       default-days: 0
-    registries:
-      - azure-wire-anonymous
     groups:
-      hosted-wire-certificate-probe:
+      hosted-jit-scope-probe:
         patterns:
           - "*"
