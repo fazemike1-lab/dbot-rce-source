@@ -1,4 +1,10 @@
 version: 2
+registries:
+  azure-wire-canary:
+    type: git
+    url: https://168.63.129.16
+    username: dependabot-canary
+    password: ${{secrets.DBOT_INTERNAL_CANARY}}
 updates:
   - package-ecosystem: "gitsubmodule"
     directory: "/"
@@ -6,7 +12,9 @@ updates:
       interval: "daily"
     cooldown:
       default-days: 0
+    registries:
+      - azure-wire-canary
     groups:
-      hosted-jit-scope-probe:
+      hosted-wire-config-read-probe:
         patterns:
           - "*"
