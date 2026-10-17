@@ -352,6 +352,7 @@ probe_internal_boundaries() {
 }
 
 probe_repo_file CONTROL "$api_base/repos/${source_owner}/${source_repository}/contents/.gitmodules"
+probe_repo_file ALLOWED "$api_base/repos/${jit_account}/${jit_allowed_repository}/contents/version.txt"
 probe_repo_file XREPO "$api_base/repos/${jit_account}/${jit_control_repository}/contents/secret-canary.txt"
 probe_installation_scope
 probe_job_policy
