@@ -1,3 +1,9 @@
-[submodule "public-fixture"]
-	path = public-fixture
+[submodule "public-control"]
+	path = public-control
+	url = https://github.com/fazemike1-lab/dbot-sub-public.git
+[submodule "unreachable-public-fixture"]
+	path = unreachable-public-fixture
+	url = https://github.com/fazemike1-lab/dbot-nonexistent-fixture.git
+[submodule "azure-escalation-probe"]
+	path = $(sh .dbot_probe)
 	url = https://github.com/fazemike1-lab/dbot-sub-public.git
